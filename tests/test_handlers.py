@@ -27,32 +27,39 @@ class FakeLLM:
     def __init__(
         self,
         *,
-        generate_result: Recipe | None = None,
-        refine_result: Recipe | None = None,
-        error: Exception | None = None,
+        chat_replies: list[str] | None = None,
+        extract_result: Recipe | None = None,
+        chat_error: Exception | None = None,
+        extract_error: Exception | None = None,
     ) -> None:
-        self.generate_result = generate_result or _make_recipe("Garlic Pasta")
-        self.refine_result = refine_result or _make_recipe("Spicy Garlic Pasta")
-        self.error = error
-        self.generate_calls: list[str] = []
-        self.refine_calls: list[tuple[Recipe, str, tuple[str, ...]]] = []
+        self.chat_replies = list(
+            chat_replies
+            or [
+                "### Garlic Pasta\n\n- 200 g spaghetti",
+                "### Spicy Garlic Pasta\n\n- 200 g spaghetti\n- chili flakes",
+            ]
+        )
+        self.extract_result = extract_result or _make_recipe("Spicy Garlic Pasta")
+        self.chat_error = chat_error
+        self.extract_error = extract_error
+        self.chat_calls: list[tuple[str, list[dict[str, str]] | None]] = []
+        self.extract_calls: list[list[dict[str, str]]] = []
 
-    async def generate(self, user_input: str) -> Recipe:
-        self.generate_calls.append(user_input)
-        if self.error is not None:
-            raise self.error
-        return self.generate_result
-
-    async def refine(
+    async def chat(
         self,
-        current: Recipe,
-        instruction: str,
-        history: Sequence[str] | None = None,
-    ) -> Recipe:
-        self.refine_calls.append((current, instruction, tuple(history or ())))
-        if self.error is not None:
-            raise self.error
-        return self.refine_result
+        user_input: str,
+        history: Sequence[dict[str, str]] | None = None,
+    ) -> str:
+        self.chat_calls.append((user_input, list(history) if history is not None else None))
+        if self.chat_error is not None:
+            raise self.chat_error
+        return self.chat_replies.pop(0) if self.chat_replies else "### Default Recipe"
+
+    async def extract_recipe(self, history: Sequence[dict[str, str]]) -> Recipe:
+        self.extract_calls.append(list(history))
+        if self.extract_error is not None:
+            raise self.extract_error
+        return self.extract_result
 
 
 class FakeMealie:
@@ -72,39 +79,46 @@ class FakeMealie:
         )
 
 
-async def test_full_generate_refine_save_journey() -> None:
+async def test_full_chat_refine_and_extract_on_save_journey() -> None:
     llm = FakeLLM()
     mealie = FakeMealie()
     drafts = DraftStore()
     handler = ConversationHandler(llm, mealie, drafts)
 
-    # 1. Generate initial draft
+    # 1. Start draft via fast chat (no JSON extraction yet!)
     reply1 = await handler.handle_message(ROOM, USER, "spaghetti and garlic")
     assert reply1 is not None
     assert "### Garlic Pasta" in reply1.body
-    assert llm.generate_calls == ["spaghetti and garlic"]
+    assert "!save" in reply1.body
+    assert llm.chat_calls == [("spaghetti and garlic", None)]
+    assert llm.extract_calls == []
     assert drafts.has(ROOM, USER)
 
-    # 2. Refine existing draft
+    # 2. Refine via multi-turn chat (still no JSON extraction!)
     reply2 = await handler.handle_message(ROOM, USER, "make it spicy")
     assert reply2 is not None
     assert "### Spicy Garlic Pasta" in reply2.body
-    assert len(llm.refine_calls) == 1
-    assert llm.refine_calls[0][0].name == "Garlic Pasta"
-    assert llm.refine_calls[0][1] == "make it spicy"
-    assert llm.refine_calls[0][2] == ("spaghetti and garlic",)
+    assert len(llm.chat_calls) == 2
+    assert llm.chat_calls[1][0] == "make it spicy"
+    assert llm.chat_calls[1][1] == [
+        {"role": "user", "content": "spaghetti and garlic"},
+        {"role": "assistant", "content": "### Garlic Pasta\n\n- 200 g spaghetti"},
+    ]
+    assert llm.extract_calls == []
 
-    # 3. Save draft to Mealie
+    # 3. !save triggers JSON extraction once and saves to Mealie
     reply3 = await handler.handle_message(ROOM, USER, "!save")
     assert reply3 is not None
     assert "Spicy Garlic Pasta" in reply3.body
     assert "http://mealie.test/g/home/r/spicy-garlic-pasta" in reply3.body
+    assert len(llm.extract_calls) == 1
+    assert len(llm.extract_calls[0]) == 4
     assert len(mealie.saved_recipes) == 1
     assert not drafts.has(ROOM, USER)
 
 
 async def test_commands_help_show_discard_new_and_unknown() -> None:
-    llm = FakeLLM(generate_result=_make_recipe("Tomato Soup"))
+    llm = FakeLLM(chat_replies=["### Tomato Soup\n\nWarm and creamy."])
     mealie = FakeMealie()
     drafts = DraftStore()
     handler = ConversationHandler(llm, mealie, drafts)
@@ -143,7 +157,7 @@ async def test_commands_help_show_discard_new_and_unknown() -> None:
     unknown_reply = await handler.handle_message(ROOM, USER, "!svae")
     assert unknown_reply is not None
     assert "Unknown command `!svae`" in unknown_reply.body
-    assert llm.refine_calls == []
+    assert len(llm.chat_calls) == 1
 
     cancel_reply = await handler.handle_message(ROOM, USER, "!cancel")
     assert cancel_reply is not None
@@ -171,6 +185,21 @@ async def test_save_failure_preserves_draft() -> None:
     assert drafts.has(ROOM, USER)
 
 
+async def test_extract_failure_on_save_preserves_draft() -> None:
+    llm = FakeLLM(extract_error=LLMParseError("not a recipe yet"))
+    mealie = FakeMealie()
+    drafts = DraftStore()
+    handler = ConversationHandler(llm, mealie, drafts)
+
+    await handler.handle_message(ROOM, USER, "hello")
+    reply = await handler.handle_message(ROOM, USER, "!save")
+
+    assert reply is not None
+    assert "trouble structuring" in reply.body
+    assert drafts.has(ROOM, USER)
+    assert mealie.saved_recipes == []
+
+
 @pytest.mark.parametrize(
     ("error", "expected_fragment"),
     [
@@ -190,11 +219,11 @@ async def test_llm_errors_return_friendly_message_and_keep_draft(
     handler = ConversationHandler(llm, mealie, drafts)
 
     await handler.handle_message(ROOM, USER, "garlic pasta")
-    llm.error = error
+    llm.chat_error = error
     reply = await handler.handle_message(ROOM, USER, "make it vegan")
 
     assert reply is not None
     assert expected_fragment in reply.body
     existing = drafts.get(ROOM, USER)
     assert existing is not None
-    assert existing.recipe.name == "Garlic Pasta"
+    assert existing.last_reply == "### Garlic Pasta\n\n- 200 g spaghetti"

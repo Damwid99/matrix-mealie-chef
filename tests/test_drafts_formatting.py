@@ -1,5 +1,6 @@
 from matrix_mealie_chef.drafts import DraftStore
 from matrix_mealie_chef.formatting import (
+    format_draft_reply,
     format_help,
     format_recipe_preview,
     format_saved_recipe,
@@ -31,29 +32,32 @@ def _sample_recipe(name: str = "Garlic Pasta") -> Recipe:
 
 def test_draft_store_isolates_by_room_and_user() -> None:
     store = DraftStore(ttl_seconds=60)
-    r1 = _sample_recipe("Pasta")
-    r2 = _sample_recipe("Soup")
 
-    store.set("!room1:ex", "@alice:ex", r1, "pasta idea")
-    store.set("!room1:ex", "@bob:ex", r2, "soup idea")
+    store.start("!room1:ex", "@alice:ex", "pasta idea", "### Pasta")
+    store.start("!room1:ex", "@bob:ex", "soup idea", "### Soup")
 
-    alice_draft = store.get("!room1:ex", "@alice:ex")
-    bob_draft = store.get("!room1:ex", "@bob:ex")
-    assert alice_draft is not None
-    assert bob_draft is not None
-    assert alice_draft.recipe.name == "Pasta"
-    assert bob_draft.recipe.name == "Soup"
+    alice_session = store.get("!room1:ex", "@alice:ex")
+    bob_session = store.get("!room1:ex", "@bob:ex")
+    assert alice_session is not None
+    assert bob_session is not None
+    assert alice_session.last_reply == "### Pasta"
+    assert bob_session.last_reply == "### Soup"
     assert store.get("!room2:ex", "@alice:ex") is None
 
 
-def test_draft_store_update_appends_and_caps_history() -> None:
-    store = DraftStore(ttl_seconds=60, max_history=2)
-    store.set("!r:ex", "@u:ex", _sample_recipe("V1"), "first")
-    store.update("!r:ex", "@u:ex", _sample_recipe("V2"), "second")
-    draft = store.update("!r:ex", "@u:ex", _sample_recipe("V3"), "third")
+def test_draft_store_append_caps_turns_and_deletes() -> None:
+    store = DraftStore(ttl_seconds=60, max_turns=2)
+    store.start("!r:ex", "@u:ex", "first", "reply 1")
+    store.append_turn("!r:ex", "@u:ex", "second", "reply 2")
+    session = store.append_turn("!r:ex", "@u:ex", "third", "reply 3")
 
-    assert draft.recipe.name == "V3"
-    assert draft.history == ("second", "third")
+    assert session.last_reply == "reply 3"
+    assert session.to_llm_messages() == [
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply 2"},
+        {"role": "user", "content": "third"},
+        {"role": "assistant", "content": "reply 3"},
+    ]
     assert store.delete("!r:ex", "@u:ex") is True
     assert store.delete("!r:ex", "@u:ex") is False
 
@@ -65,16 +69,27 @@ def test_draft_store_ttl_expiration_and_refresh() -> None:
         return now
 
     store = DraftStore(ttl_seconds=10.0, timer=fake_clock)
-    store.set("!r:ex", "@u:ex", _sample_recipe("V1"), "initial")
+    store.start("!r:ex", "@u:ex", "initial", "### V1")
 
     now = 108.0
-    store.update("!r:ex", "@u:ex", _sample_recipe("V2"), "tweak")
+    store.append_turn("!r:ex", "@u:ex", "tweak", "### V2")
 
     now = 115.0  # 7s after update -> still alive
     assert store.has("!r:ex", "@u:ex") is True
 
     now = 119.0  # 11s after update -> expired
     assert store.get("!r:ex", "@u:ex") is None
+
+
+def test_format_draft_reply_includes_optional_footer() -> None:
+    with_footer = format_draft_reply("### Garlic Pasta\n\n- 200 g spaghetti")
+    assert "### Garlic Pasta" in with_footer.body
+    assert "!save" in with_footer.body
+    assert "<h3>Garlic Pasta</h3>" in with_footer.formatted_body
+    assert "<li>200 g spaghetti</li>" in with_footer.formatted_body
+
+    without_footer = format_draft_reply("### Garlic Pasta", include_footer=False)
+    assert "!save" not in without_footer.body
 
 
 def test_format_recipe_preview_renders_markdown_and_html() -> None:

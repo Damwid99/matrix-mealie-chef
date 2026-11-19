@@ -2,12 +2,12 @@
 
 import json
 import re
-from collections.abc import Sequence  # noqa: F401
+from collections.abc import Sequence
 from typing import Any
 
 import litellm
 import structlog
-from litellm.exceptions import (  # noqa: F401
+from litellm.exceptions import (
     AuthenticationError,
     BadRequestError,
     RateLimitError,
@@ -17,7 +17,7 @@ from litellm.utils import supports_reasoning
 from pydantic import ValidationError
 
 from matrix_mealie_chef.models import Recipe
-from matrix_mealie_chef.prompts import build_generate_messages, build_refine_messages  # noqa: F401
+from matrix_mealie_chef.prompts import build_chat_messages, build_extract_messages
 
 logger = structlog.get_logger(__name__)
 
@@ -68,7 +68,7 @@ def _parse_recipe(raw: str) -> Recipe:
 
 
 class RecipeLLMClient:
-    """Generates and refines structured Recipe objects using LiteLLM."""
+    """Conversational recipe assistant and structured extractor powered by LiteLLM."""
 
     def __init__(
         self,
@@ -78,7 +78,7 @@ class RecipeLLMClient:
         api_base: str | None = None,
         timeout: float = 120.0,
         max_validation_retries: int = 2,
-        max_history: int = 6,
+        max_history_messages: int = 12,
         temperature: float | None = None,
         reasoning_effort: str | None = "low",
     ) -> None:
@@ -87,7 +87,7 @@ class RecipeLLMClient:
         self._api_base = api_base
         self._timeout = timeout
         self._max_validation_retries = max_validation_retries
-        self._max_history = max_history
+        self._max_history_messages = max_history_messages
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
         self._supports_response_format = True
@@ -149,6 +149,26 @@ class RecipeLLMClient:
             raise LLMParseError("LLM returned an empty message")
         return content
 
+    async def chat(
+        self,
+        user_input: str,
+        history: Sequence[dict[str, str]] | None = None,
+    ) -> str:
+        """Send a fast conversational message and return the Markdown reply."""
+        messages = build_chat_messages(
+            user_input,
+            history,
+            max_messages=self._max_history_messages,
+        )
+        reply = await self._call_model(messages, use_response_format=False)
+        logger.info("llm_chat_reply_generated", model=self._model, chars=len(reply))
+        return reply.strip()
+
+    async def extract_recipe(self, history: Sequence[dict[str, str]]) -> Recipe:
+        """Extract a validated structured Recipe from a chat conversation (used on `!save`)."""
+        messages = build_extract_messages(history, max_messages=self._max_history_messages)
+        return await self._complete_recipe(messages)
+
     async def _complete_recipe(self, messages: list[dict[str, str]]) -> Recipe:
         conversation = list(messages)
         last_error: Exception | None = None
@@ -160,7 +180,7 @@ class RecipeLLMClient:
             )
             try:
                 recipe = _parse_recipe(raw_content)
-                logger.info("llm_recipe_generated", model=self._model, name=recipe.name)
+                logger.info("llm_recipe_extracted", model=self._model, name=recipe.name)
                 return recipe
             except (ValueError, json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
@@ -185,23 +205,3 @@ class RecipeLLMClient:
             f"Failed to produce a valid recipe after {self._max_validation_retries + 1} attempts: "
             f"{last_error}"
         )
-
-    async def generate(self, user_input: str) -> Recipe:
-        """Generate a new structured recipe from free-form user text."""
-        messages = build_generate_messages(user_input)
-        return await self._complete_recipe(messages)
-
-    async def refine(
-        self,
-        current: Recipe,
-        instruction: str,
-        history: Sequence[str] | None = None,
-    ) -> Recipe:
-        """Refine an existing recipe draft based on natural-language feedback."""
-        messages = build_refine_messages(
-            current,
-            instruction,
-            history,
-            max_history=self._max_history,
-        )
-        return await self._complete_recipe(messages)
