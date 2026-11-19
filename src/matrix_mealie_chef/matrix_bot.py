@@ -328,6 +328,82 @@ class MatrixBot:
                 error=response.message,
             )
 
+    def _register_invite_callback(self) -> None:
+        self._client.add_event_callback(self._on_invite, InviteMemberEvent)
+
+    def _register_message_callback(self) -> None:
+        self._client.add_event_callback(self._on_message, RoomMessageText)
+
+    async def run_forever(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+        sync_timeout_ms: int = 30000,
+        initial_backoff: float = 2.0,
+        max_backoff: float = 60.0,
+    ) -> None:
+        """Authenticate, perform initial sync, and run the sync loop with reconnect backoff."""
+        if self._handler is None:
+            raise MatrixBotError("Cannot run MatrixBot without a message handler")
+
+        await self.authenticate()
+        # Accept pending invites during initial sync, but attach message handler only after
+        # initial sync drains historical messages.
+        self._register_invite_callback()
+        await self.initial_sync()
+        self._register_message_callback()
+
+        shutdown = stop_event or asyncio.Event()
+        backoff = initial_backoff
+
+        while not shutdown.is_set():
+            started = time.monotonic()
+            sync_task: asyncio.Task[Any] = asyncio.create_task(
+                self._client.sync_forever(timeout=sync_timeout_ms, full_state=False)
+            )
+            stop_task: asyncio.Task[bool] = asyncio.create_task(shutdown.wait())
+            try:
+                _, pending = await asyncio.wait(
+                    {sync_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                if shutdown.is_set():
+                    break
+
+                exc = sync_task.exception()
+                if exc is None:
+                    logger.info("matrix_sync_loop_ended")
+                    break
+
+                if time.monotonic() - started >= 30.0:
+                    backoff = initial_backoff
+
+                logger.warning(
+                    "matrix_sync_error_reconnecting",
+                    error=str(exc),
+                    backoff_seconds=backoff,
+                )
+            finally:
+                if not sync_task.done():
+                    sync_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sync_task
+                if not stop_task.done():
+                    stop_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stop_task
+
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=backoff)
+                break
+            except TimeoutError:
+                backoff = min(backoff * 2.0, max_backoff)
+
     async def close(self) -> None:
         """Close the Matrix client HTTP session."""
         await self._client.close()

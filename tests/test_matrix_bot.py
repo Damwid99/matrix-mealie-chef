@@ -66,9 +66,19 @@ class FakeAsyncClient:
         self.joined_rooms: list[str] = []
         self.typing_calls: list[tuple[str, bool]] = []
         self.sent_messages: list[tuple[str, str, dict[str, Any]]] = []
+        self.sync_forever_calls = 0
+        self.sync_forever_errors: list[Exception] = []
+        self.sync_forever_started = asyncio.Event()
 
     def restore_login(self, user_id: str, device_id: str, access_token: str) -> None:
         self.restored.append((user_id, device_id, access_token))
+
+    async def sync_forever(self, **_: Any) -> None:
+        self.sync_forever_calls += 1
+        self.sync_forever_started.set()
+        if self.sync_forever_errors:
+            raise self.sync_forever_errors.pop(0)
+        await asyncio.Event().wait()
 
     async def login(self, password: str | None = None, device_name: str = "") -> Any:
         self.login_calls.append({"password": password, "device_name": device_name})
@@ -396,3 +406,42 @@ async def test_on_message_serializes_room_processing_and_clears_typing_on_error(
         ("!kitchen:example.com", True),
         ("!kitchen:example.com", False),
     ]
+
+
+async def test_run_forever_starts_and_stops_cleanly(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(bot.run_forever(stop_event=stop_event))
+    await asyncio.wait_for(fake_client.sync_forever_started.wait(), timeout=2.0)
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(fake_client.restored) == 1
+    assert len(fake_client.sync_calls) == 1
+    assert [f for _, f in fake_client.callbacks] == [InviteMemberEvent, RoomMessageText]
+    assert fake_client.sync_forever_calls == 1
+
+
+async def test_run_forever_reconnects_after_sync_error(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    fake_client.sync_forever_errors = [ConnectionError("temporary drop")]
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+    stop_event = asyncio.Event()
+
+    async def stop_after_reconnect() -> None:
+        while fake_client.sync_forever_calls < 2:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        stop_event.set()
+
+    stopper = asyncio.create_task(stop_after_reconnect())
+    await asyncio.wait_for(
+        bot.run_forever(stop_event=stop_event, initial_backoff=0.01, max_backoff=0.02),
+        timeout=2.0,
+    )
+    await stopper
+
+    assert fake_client.sync_forever_calls == 2
