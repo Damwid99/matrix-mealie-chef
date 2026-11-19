@@ -16,16 +16,19 @@ _FOOTER = (
 _HELP_TEXT = """\
 ### Matrix Mealie Chef
 
-Send me ingredients, a rough dinner idea, or messy recipe notes and I will draft a structured recipe for you.
+Send me ingredients, a rough dinner idea, or messy recipe notes and we can brainstorm
+and draft a recipe together.
 
-Once a draft is open, reply naturally to refine it (e.g. *"double the servings"*, *"make it vegan"*, *"swap butter for olive oil"*).
+Reply naturally to refine it (e.g. *"double the servings"*, *"make it vegan"*,
+*"swap butter for olive oil"*), and when it looks good, type `!save` to structure
+and save it to Mealie.
 
 **Commands**
 
-- `!save` — save the current draft to Mealie
-- `!show` — display the current draft again
+- `!save` — extract and save the current draft to Mealie
+- `!show` — display the latest draft reply again
 - `!discard` (or `!cancel`) — throw away the current draft
-- `!new <idea>` — discard any active draft and generate a fresh recipe
+- `!new <idea>` — discard any active draft and start fresh
 - `!help` — show this message
 """
 
@@ -46,6 +49,14 @@ def markdown_to_html(text: str) -> str:
 def format_markdown(text: str) -> FormattedMessage:
     """Wrap a Markdown string as a FormattedMessage."""
     return FormattedMessage(body=text, formatted_body=markdown_to_html(text))
+
+
+def format_draft_reply(reply_markdown: str, *, include_footer: bool = True) -> FormattedMessage:
+    """Format a conversational Markdown recipe draft reply with an optional command footer."""
+    cleaned = reply_markdown.strip()
+    if include_footer:
+        return format_markdown(f"{cleaned}\n\n{_FOOTER}")
+    return format_markdown(cleaned)
 
 
 def format_recipe_preview(recipe: Recipe, *, include_footer: bool = True) -> FormattedMessage:

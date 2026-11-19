@@ -7,28 +7,50 @@ from matrix_mealie_chef.models import Recipe
 
 _SCHEMA_JSON = json.dumps(Recipe.llm_json_schema(), indent=2)
 
-SYSTEM_PROMPT = f"""\
-You are Matrix Mealie Chef, a practical and creative culinary assistant.
-Your job is to turn user notes, leftover ingredients, or rough meal ideas into a complete,
-well-proportioned, cookable recipe formatted strictly as JSON.
+CHAT_SYSTEM_PROMPT = """\
+You are Matrix Mealie Chef, a practical, friendly culinary assistant in a chat room.
+You help users brainstorm meal ideas, turn leftover ingredients or messy notes into complete
+recipes, and iteratively refine recipes through natural conversation.
 
 Rules:
-1. Language: ALWAYS write all text fields (name, description, servings, times, ingredients,
-   instructions, tags, categories) in the same language as the user's message, unless the user
-   explicitly asks for a different language.
-2. Units & proportions: Use metric units (g, ml, kg, l, tbsp/tsp or natural local equivalents)
-   by default, unless the user writes in imperial units. Include sensible pantry basics
-   (oil, salt, pepper, water) when needed so the recipe is genuinely cookable.
+1. Language: ALWAYS reply in the english, no matter which language is being used by the user,
+   unless the user explicitly asks to switch or translate languages.
+2. Natural conversation: If the user asks to brainstorm ideas or asks a cooking question, answer
+   helpfully and concisely. Once they pick a dish, give ingredients/notes, or ask for a recipe,
+   present a complete, well-proportioned, cookable recipe in clean Markdown.
+3. Recipe structure (when drafting or updating a recipe):
+   - `### Recipe Title`
+   - Short 1-2 sentence description
+   - **Servings**, **Prep**, **Cook**, and **Total** times
+   - **Ingredients** as a bullet list with realistic metric amounts (g, ml, kg, l, tbsp/tsp or
+     natural local equivalents) unless the user uses imperial units; include pantry basics
+     (oil, salt, pepper, water) when needed
+   - **Instructions** as a numbered list of clear, chronological steps
+   - **Tags** (2-5 concise tags) and **Categories** (1-2 broad meal categories)
+4. Refinements: When the user asks to change a recipe (swap ingredients, scale servings, make it
+   spicier/vegan, adjust tags, etc.), reply with the complete updated Markdown recipe so it is
+   easy to read and ready to save.
+5. Format: Reply in clean, readable Markdown only — NEVER output raw JSON in chat.
+"""
+
+EXTRACT_SYSTEM_PROMPT = f"""\
+You are a strict recipe data extractor for Mealie.
+Read the conversation below and extract the LATEST finalized recipe into a single valid JSON
+object matching the JSON Schema.
+
+Rules:
+1. Language: ALWAYS use english as the language for the latest recipe draft across all fields
+   (name, description, servings, times, ingredients, instructions, tags, categories).
+2. Faithfulness: Capture every ingredient, quantity, unit, preparation note, instruction step,
+   time, serving count, tag, and category from the latest recipe version in the conversation.
 3. Ingredients: Split each ingredient into numeric `quantity` (or null for "to taste"),
    `unit` (or null for countable items like eggs), `food` (concise ingredient name), and
    optional `note` (prep detail such as "diced" or "to taste").
-4. Instructions: Write clear, chronological, actionable steps. Only add a step `title` when
-   grouping a distinct sub-part (e.g. "Sauce", "Assembly").
-5. Times & servings: Provide realistic `servings`, `prep_time`, `cook_time`, and `total_time`
-   in the recipe's language (e.g. "15 min", "4 servings").
-6. Tags & categories: Add 2-5 concise, useful tags (e.g. "quick", "pasta", "vegetarian") and
-   1-2 broad categories (e.g. "Dinner", "Breakfast") in the recipe's language.
-7. Output format: Return ONLY a single valid JSON object matching the JSON Schema below.
+4. Instructions: Preserve clear, chronological steps; only set `title` when a step belongs to
+   a named section (e.g. "Sauce", "Assembly").
+5. Tags & categories: Provide 2-5 concise tags and 1-2 broad categories in the recipe's language
+   (infer sensible ones if omitted in the chat draft).
+6. Output format: Return ONLY a single valid JSON object matching the JSON Schema below.
    Do not wrap it in markdown code fences or add any explanation outside the JSON.
 
 JSON Schema:
@@ -36,54 +58,50 @@ JSON Schema:
 """
 
 
-def build_generate_messages(user_input: str) -> list[dict[str, str]]:
-    """Build chat messages to generate a fresh recipe draft from free-form text."""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input.strip()},
-    ]
-
-
-REFINE_SYSTEM_PROMPT = (
-    SYSTEM_PROMPT
-    + """
-Refinement rules:
-8. You are updating an EXISTING recipe draft based on the user's feedback.
-9. Apply the requested changes accurately (e.g. swap ingredients, scale quantities and
-   servings proportionally, adjust spiciness, update tags or times) while preserving all
-   other details of the current recipe unless they conflict with the change.
-10. Keep the recipe in the same language as the current draft unless the user explicitly asks
-    to translate or switch languages.
-11. Always return the COMPLETE updated recipe JSON (not a partial diff).
-"""
-)
-
-
-def build_refine_messages(
-    current: Recipe,
-    instruction: str,
-    history: Sequence[str] | None = None,
+def _trim_history(
+    history: Sequence[dict[str, str]],
     *,
-    max_history: int = 6,
+    max_messages: int,
 ) -> list[dict[str, str]]:
-    """Build chat messages to refine an existing recipe draft."""
-    sections = [
-        "Current recipe (JSON):",
-        current.model_dump_json(indent=2),
+    if max_messages <= 0:
+        return []
+    cleaned = [
+        {"role": msg["role"], "content": msg["content"].strip()}
+        for msg in history
+        if msg.get("content", "").strip()
     ]
+    return cleaned[-max_messages:]
 
-    if history and max_history > 0:
-        cleaned = [item.strip() for item in history if item.strip()]
-        trimmed = cleaned[-max_history:]
-        if trimmed:
-            history_lines = "\n".join(f"- {item}" for item in trimmed)
-            sections.append(
-                f"Earlier requests in this session (oldest to newest):\n{history_lines}"
-            )
 
-    sections.append(f"Requested change:\n{instruction.strip()}")
+def build_chat_messages(
+    user_input: str,
+    history: Sequence[dict[str, str]] | None = None,
+    *,
+    max_messages: int = 12,
+) -> list[dict[str, str]]:
+    """Build chat messages for conversational recipe brainstorming and refinement."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    if history:
+        messages.extend(_trim_history(history, max_messages=max_messages))
+    messages.append({"role": "user", "content": user_input.strip()})
+    return messages
 
-    return [
-        {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-        {"role": "user", "content": "\n\n".join(sections)},
-    ]
+
+def build_extract_messages(
+    history: Sequence[dict[str, str]],
+    *,
+    max_messages: int = 12,
+) -> list[dict[str, str]]:
+    """Build messages to extract the finalized Recipe JSON from a chat draft session."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": EXTRACT_SYSTEM_PROMPT}]
+    messages.extend(_trim_history(history, max_messages=max_messages))
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Extract the latest finalized recipe from our conversation above into a single "
+                "valid JSON object matching the schema."
+            ),
+        }
+    )
+    return messages

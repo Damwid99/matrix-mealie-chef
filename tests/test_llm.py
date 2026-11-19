@@ -12,7 +12,7 @@ from matrix_mealie_chef.llm import (
     LLMRateLimitError,
     RecipeLLMClient,
 )
-from matrix_mealie_chef.models import Ingredient, Recipe, Step
+from matrix_mealie_chef.models import Recipe
 
 
 def _fake_response(content: str) -> SimpleNamespace:
@@ -42,12 +42,14 @@ def _valid_recipe_json(name: str = "Garlic Pasta") -> str:
     )
 
 
-async def test_generate_recipe_success(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_chat_sends_plain_markdown_request_without_response_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured_kwargs: dict[str, Any] = {}
 
     async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
         captured_kwargs.update(kwargs)
-        return _fake_response(_valid_recipe_json())
+        return _fake_response("### Garlic Pasta\n\nCook pasta with garlic oil.")
 
     monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
 
@@ -56,28 +58,82 @@ async def test_generate_recipe_success(monkeypatch: pytest.MonkeyPatch) -> None:
         api_key="test-key",
         api_base="http://custom.local",
     )
-    recipe = await client.generate("I have spaghetti and garlic")
+    reply = await client.chat("I have spaghetti and garlic")
 
-    assert recipe.name == "Garlic Pasta"
-    assert len(recipe.ingredients) == 2
+    assert reply == "### Garlic Pasta\n\nCook pasta with garlic oil."
     assert captured_kwargs["model"] == "gemini/gemini-2.5-flash"
     assert captured_kwargs["api_key"] == "test-key"
     assert captured_kwargs["api_base"] == "http://custom.local"
-    assert captured_kwargs["response_format"] is Recipe
     assert captured_kwargs["drop_params"] is True
     assert captured_kwargs["reasoning_effort"] == "low"
     assert "temperature" not in captured_kwargs
+    assert "response_format" not in captured_kwargs
     assert captured_kwargs["messages"][0]["role"] == "system"
     assert captured_kwargs["messages"][1] == {
         "role": "user",
-        "content": "I have spaghetti an garlic",
+        "content": "I have spaghetti and garlic",
     }
 
 
-async def test_generate_extracts_json_from_markdown_fence(
+async def test_chat_includes_trimmed_history_and_omits_reasoning_for_ollama(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fenced = f"Sure! Here is your recipe:\n```json\n{_valid_recipe_json('Tomato Soup')}\n```"
+    captured_kwargs: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return _fake_response("### Spicy Garlic Pasta")
+
+    monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
+
+    client = RecipeLLMClient("ollama/llama3.1", max_history_messages=2)
+    history = [
+        {"role": "user", "content": "old user msg"},
+        {"role": "assistant", "content": "old assistant msg"},
+        {"role": "user", "content": "garlic pasta"},
+        {"role": "assistant", "content": "### Garlic Pasta"},
+    ]
+    reply = await client.chat("make it spicier", history=history)
+
+    assert reply == "### Spicy Garlic Pasta"
+    assert "reasoning_effort" not in captured_kwargs
+    assert captured_kwargs["messages"][1:] == [
+        {"role": "user", "content": "garlic pasta"},
+        {"role": "assistant", "content": "### Garlic Pasta"},
+        {"role": "user", "content": "make it spicier"},
+    ]
+
+
+async def test_extract_recipe_uses_response_format_and_parses_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
+        captured_kwargs.update(kwargs)
+        return _fake_response(_valid_recipe_json("Spicy Garlic Pasta"))
+
+    monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
+
+    client = RecipeLLMClient("gemini/gemini-2.5-flash", api_key="test-key")
+    history = [
+        {"role": "user", "content": "garlic pasta"},
+        {"role": "assistant", "content": "### Spicy Garlic Pasta\n\nIngredients: ..."},
+    ]
+    recipe = await client.extract_recipe(history)
+
+    assert recipe.name == "Spicy Garlic Pasta"
+    assert captured_kwargs["response_format"] is Recipe
+    assert captured_kwargs["messages"][0]["role"] == "system"
+    assert "JSON Schema:" in captured_kwargs["messages"][0]["content"]
+    assert captured_kwargs["messages"][1:3] == history
+    assert captured_kwargs["messages"][3]["role"] == "user"
+
+
+async def test_extract_recipe_handles_markdown_fenced_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fenced = f"Sure! Here is the JSON:\n```json\n{_valid_recipe_json('Tomato Soup')}\n```"
 
     async def fake_acompletion(**_: Any) -> SimpleNamespace:
         return _fake_response(fenced)
@@ -85,12 +141,12 @@ async def test_generate_extracts_json_from_markdown_fence(
     monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
 
     client = RecipeLLMClient("ollama/llama3.1")
-    recipe = await client.generate("tomato soup")
+    recipe = await client.extract_recipe([{"role": "assistant", "content": "### Tomato Soup"}])
 
     assert recipe.name == "Tomato Soup"
 
 
-async def test_generate_falls_back_when_response_format_unsupported(
+async def test_extract_recipe_falls_back_when_response_format_unsupported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -108,7 +164,7 @@ async def test_generate_falls_back_when_response_format_unsupported(
     monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
 
     client = RecipeLLMClient("ollama/llama3.1")
-    recipe = await client.generate("eggs and cheese")
+    recipe = await client.extract_recipe([{"role": "assistant", "content": "### Omelette"}])
 
     assert recipe.name == "Omelette"
     assert len(calls) == 2
@@ -116,7 +172,7 @@ async def test_generate_falls_back_when_response_format_unsupported(
     assert "response_format" not in calls[1]
 
 
-async def test_generate_retries_on_validation_error_with_feedback(
+async def test_extract_recipe_retries_on_validation_error_with_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[dict[str, str]]] = []
@@ -132,7 +188,7 @@ async def test_generate_retries_on_validation_error_with_feedback(
     monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
 
     client = RecipeLLMClient("gemini/gemini-2.5-flash")
-    recipe = await client.generate("something quick")
+    recipe = await client.extract_recipe([{"role": "assistant", "content": "### Fixed Dish"}])
 
     assert recipe.name == "Fixed Dish"
     assert len(calls) == 2
@@ -140,7 +196,7 @@ async def test_generate_retries_on_validation_error_with_feedback(
     assert "not valid Recipe JSON" in calls[1][-1]["content"]
 
 
-async def test_generate_raises_parse_error_after_retries_exhausted(
+async def test_extract_recipe_raises_parse_error_after_retries_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     call_count = 0
@@ -154,12 +210,12 @@ async def test_generate_raises_parse_error_after_retries_exhausted(
 
     client = RecipeLLMClient("gemini/gemini-2.5-flash", max_validation_retries=2)
     with pytest.raises(LLMParseError):
-        await client.generate("make dinner")
+        await client.extract_recipe([{"role": "assistant", "content": "just chatting"}])
 
     assert call_count == 3
 
 
-async def test_generate_maps_auth_and_rate_limit_errors(
+async def test_chat_maps_auth_and_rate_limit_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def raise_auth(**_: Any) -> SimpleNamespace:
@@ -172,7 +228,7 @@ async def test_generate_maps_auth_and_rate_limit_errors(
     monkeypatch.setattr(llm_module.litellm, "acompletion", raise_auth)
     client = RecipeLLMClient("gemini/gemini-2.5-flash")
     with pytest.raises(LLMAuthError):
-        await client.generate("pasta")
+        await client.chat("pasta")
 
     async def raise_rate_limit(**_: Any) -> SimpleNamespace:
         raise litellm.RateLimitError(
@@ -183,63 +239,4 @@ async def test_generate_maps_auth_and_rate_limit_errors(
 
     monkeypatch.setattr(llm_module.litellm, "acompletion", raise_rate_limit)
     with pytest.raises(LLMRateLimitError):
-        await client.generate("pasta")
-
-
-def _sample_draft() -> Recipe:
-    return Recipe(
-        name="Garlic Pasta",
-        description="Simple garlicky spaghetti.",
-        servings="2 servings",
-        ingredients=[
-            Ingredient(quantity=200, unit="g", food="spaghetti"),
-            Ingredient(quantity=3, food="garlic cloves"),
-        ],
-        instructions=[Step(text="Boil pasta and toss with garlic oil.")],
-        tags=["pasta"],
-    )
-
-
-async def test_refine_recipe_sends_current_draft_and_instruction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured_messages: list[dict[str, str]] = []
-
-    async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
-        captured_messages.extend(kwargs["messages"])
-        return _fake_response(_valid_recipe_json("Spicy Garlic Pasta"))
-
-    monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
-
-    client = RecipeLLMClient("gemini/gemini-2.5-flash")
-    updated = await client.refine(_sample_draft(), "make it spicier with chili flakes")
-
-    assert updated.name == "Spicy Garlic Pasta"
-    assert captured_messages[0]["role"] == "system"
-    assert "Refinement rules:" in captured_messages[0]["content"]
-    user_prompt = captured_messages[1]["content"]
-    assert '"name": "Garlic Pasta"' in user_prompt
-    assert "make it spicier with chili flakes" in user_prompt
-    assert "Earlier requests" not in user_prompt
-
-
-async def test_refine_limits_history_size(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured_messages: list[dict[str, str]] = []
-
-    async def fake_acompletion(**kwargs: Any) -> SimpleNamespace:
-        captured_messages.extend(kwargs["messages"])
-        return _fake_response(_valid_recipe_json("Garlic Pasta"))
-
-    monkeypatch.setattr(llm_module.litellm, "acompletion", fake_acompletion)
-
-    client = RecipeLLMClient("gemini/gemini-2.5-flash", max_history=2)
-    history = ["req 1", "   ", "req 2", "req 3", "req 4"]
-    await client.refine(_sample_draft(), "double the servings", history=history)
-
-    user_prompt = captured_messages[1]["content"]
-    assert "Earlier requests" in user_prompt
-    assert "req 1" not in user_prompt
-    assert "req 2" not in user_prompt
-    assert "- req 3" in user_prompt
-    assert "- req 4" in user_prompt
-    assert "double the servings" in user_prompt
+        await client.chat("pasta")

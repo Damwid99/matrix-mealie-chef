@@ -5,12 +5,12 @@ from typing import Protocol
 
 import structlog
 
-from matrix_mealie_chef.drafts import DraftStore, RecipeDraft
+from matrix_mealie_chef.drafts import DraftSession, DraftStore
 from matrix_mealie_chef.formatting import (
     FormattedMessage,
+    format_draft_reply,
     format_help,
     format_markdown,
-    format_recipe_preview,
     format_saved_recipe,
 )
 from matrix_mealie_chef.llm import LLMAuthError, LLMError, LLMParseError, LLMRateLimitError
@@ -21,15 +21,17 @@ logger = structlog.get_logger(__name__)
 
 
 class RecipeLLM(Protocol):
-    """Protocol for recipe generation and refinement backends."""
+    """Protocol for conversational recipe drafting and final JSON extraction."""
 
-    async def generate(self, user_input: str) -> Recipe: ...
-
-    async def refine(
+    async def chat(
         self,
-        current: Recipe,
-        instruction: str,
-        history: Sequence[str] | None = None,
+        user_input: str,
+        history: Sequence[dict[str, str]] | None = None,
+    ) -> str: ...
+
+    async def extract_recipe(
+        self,
+        history: Sequence[dict[str, str]],
     ) -> Recipe: ...
 
 
@@ -70,10 +72,10 @@ class ConversationHandler:
             if len(command) > 1 and command[1:].isalpha():
                 return await self._handle_command(room_id, user_id, command, arg)
 
-        draft = self._drafts.get(room_id, user_id)
-        if draft is None:
-            return await self._generate_draft(room_id, user_id, cleaned)
-        return await self._refine_draft(room_id, user_id, draft, cleaned)
+        session = self._drafts.get(room_id, user_id)
+        if session is None:
+            return await self._start_draft(room_id, user_id, cleaned)
+        return await self._continue_draft(room_id, user_id, session, cleaned)
 
     async def _handle_command(
         self,
@@ -85,13 +87,13 @@ class ConversationHandler:
         if command == "!help":
             return format_help()
         if command == "!show":
-            draft = self._drafts.get(room_id, user_id)
-            if draft is None:
+            session = self._drafts.get(room_id, user_id)
+            if session is None or session.last_reply is None:
                 return format_markdown(
                     "You do not have an active recipe draft. "
                     "Send me ingredients or a meal idea to start one!"
                 )
-            return format_recipe_preview(draft.recipe)
+            return format_draft_reply(session.last_reply)
         if command in ("!discard", "!cancel"):
             if self._drafts.delete(room_id, user_id):
                 return format_markdown(
@@ -106,50 +108,55 @@ class ConversationHandler:
                     "Usage: `!new <ingredients or recipe idea>` "
                     "(for example: `!new creamy mushroom risotto`)."
                 )
-            return await self._generate_draft(room_id, user_id, arg)
+            return await self._start_draft(room_id, user_id, arg)
         return format_markdown(
             f"Unknown command `{command}`. Send `!help` to see available commands."
         )
 
-    async def _generate_draft(
+    async def _start_draft(
         self,
         room_id: str,
         user_id: str,
         prompt: str,
     ) -> FormattedMessage:
         try:
-            recipe = await self._llm.generate(prompt)
+            reply = await self._llm.chat(prompt)
         except LLMError as exc:
-            return self._format_llm_error(exc, action="generate", room_id=room_id, user_id=user_id)
+            return self._format_llm_error(exc, action="chat", room_id=room_id, user_id=user_id)
 
-        self._drafts.set(room_id, user_id, recipe, prompt)
-        return format_recipe_preview(recipe)
+        self._drafts.start(room_id, user_id, prompt, reply)
+        return format_draft_reply(reply)
 
-    async def _refine_draft(
+    async def _continue_draft(
         self,
         room_id: str,
         user_id: str,
-        draft: RecipeDraft,
+        session: DraftSession,
         instruction: str,
     ) -> FormattedMessage:
         try:
-            updated = await self._llm.refine(draft.recipe, instruction, history=draft.history)
+            reply = await self._llm.chat(instruction, history=session.to_llm_messages())
         except LLMError as exc:
-            return self._format_llm_error(exc, action="refine", room_id=room_id, user_id=user_id)
+            return self._format_llm_error(exc, action="chat", room_id=room_id, user_id=user_id)
 
-        self._drafts.update(room_id, user_id, updated, instruction)
-        return format_recipe_preview(updated)
+        self._drafts.append_turn(room_id, user_id, instruction, reply)
+        return format_draft_reply(reply)
 
     async def _save_draft(self, room_id: str, user_id: str) -> FormattedMessage:
-        draft = self._drafts.get(room_id, user_id)
-        if draft is None:
+        session = self._drafts.get(room_id, user_id)
+        if session is None or not session.messages:
             return format_markdown(
                 "Nothing to save — you do not have an active draft yet. "
                 "Send me ingredients or a meal idea first!"
             )
 
         try:
-            created = await self._mealie.create_recipe(draft.recipe)
+            recipe = await self._llm.extract_recipe(session.to_llm_messages())
+        except LLMError as exc:
+            return self._format_llm_error(exc, action="extract", room_id=room_id, user_id=user_id)
+
+        try:
+            created = await self._mealie.create_recipe(recipe)
         except MealieAuthError as exc:
             logger.error(
                 "mealie_save_auth_failed",
@@ -216,7 +223,8 @@ class ConversationHandler:
                 error=str(exc),
             )
             return format_markdown(
-                "I had trouble structuring that recipe. Try rephrasing or giving a bit more detail."
+                "I had trouble structuring that recipe. "
+                "Make sure we have a complete recipe draft in chat, or try `!save` again."
             )
         logger.error(
             "llm_error",
