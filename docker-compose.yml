@@ -1,0 +1,14 @@
+services:
+  matrix-mealie-chef:
+    image: ghcr.io/damwid99/matrix-mealie-chef:latest
+    # Uncomment to build locally instead of pulling from GHCR:
+    # build: .
+    container_name: matrix-mealie-chef
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      LOG_JSON: "true"
+    volumes:
+      - ./data:/app/data
