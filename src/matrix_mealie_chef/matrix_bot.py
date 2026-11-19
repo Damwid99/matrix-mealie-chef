@@ -1,16 +1,31 @@
 """Matrix client authentication, session persistence, and event wiring."""
 
+import asyncio
 import contextlib
 import json
 import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Protocol  # noqa: F401
 
 import structlog
-from nio import AsyncClient, LoginError, LoginResponse, SyncError, SyncResponse
+from nio import (  # noqa: F401
+    AsyncClient,
+    Event,
+    InviteMemberEvent,
+    JoinError,
+    LoginError,
+    LoginResponse,
+    MatrixRoom,
+    RoomMessageText,
+    RoomSendError,
+    SyncError,
+    SyncResponse,
+)
 
 from matrix_mealie_chef.config import Settings
+from matrix_mealie_chef.formatting import FormattedMessage  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -37,6 +52,17 @@ class MatrixSession:
     user_id: str
     device_id: str
     access_token: str
+
+
+class MessageHandler(Protocol):
+    """Protocol for handling incoming user messages."""
+
+    async def handle_message(
+        self,
+        room_id: str,
+        user_id: str,
+        text: str,
+    ) -> FormattedMessage | None: ...
 
 
 def load_session(path: Path) -> MatrixSession | None:
@@ -90,9 +116,13 @@ class MatrixBot:
         self,
         settings: Settings,
         *,
+        handler: MessageHandler | None = None,
         client: AsyncClient | None = None,
     ) -> None:
         self._settings = settings
+        self._handler = handler
+        self._allowed_users: frozenset[str] = frozenset(settings.allowed_user_ids)
+        self._room_locks: dict[str, asyncio.Lock] = {}
         self._session_path = settings.data_dir / SESSION_FILENAME
         self._client = client or AsyncClient(
             homeserver=settings.matrix_homeserver,
@@ -198,6 +228,105 @@ class MatrixBot:
         next_batch: str = response.next_batch
         logger.info("matrix_initial_sync_complete", next_batch=next_batch)
         return next_batch
+
+    def register_callbacks(self) -> None:
+        """Register Matrix event callbacks for room messages and invites."""
+        if self._handler is None:
+            raise MatrixBotError("Cannot register callbacks without a message handler")
+        self._client.add_event_callback(self._on_message, RoomMessageText)
+        self._client.add_event_callback(self._on_invite, InviteMemberEvent)
+
+    async def _on_invite(self, room: MatrixRoom, event: Event) -> None:
+        if not isinstance(event, InviteMemberEvent):
+            return
+        if event.membership != "invite" or event.state_key != self._settings.matrix_user_id:
+            return
+        if event.sender not in self._allowed_users:
+            logger.info(
+                "matrix_invite_ignored_unauthorized",
+                room_id=room.room_id,
+                sender=event.sender,
+            )
+            return
+
+        response = await self._client.join(room.room_id)
+        if isinstance(response, JoinError):
+            logger.warning(
+                "matrix_invite_join_failed",
+                room_id=room.room_id,
+                sender=event.sender,
+                error=response.message,
+            )
+            return
+        logger.info("matrix_room_joined", room_id=room.room_id, invited_by=event.sender)
+
+    async def _on_message(self, room: MatrixRoom, event: Event) -> None:
+        if not isinstance(event, RoomMessageText) or self._handler is None:
+            return
+        if event.sender == self._settings.matrix_user_id:
+            return
+        if event.server_timestamp < self._started_at_ms:
+            logger.debug(
+                "matrix_message_ignored_pre_startup",
+                room_id=room.room_id,
+                event_id=event.event_id,
+            )
+            return
+        if event.sender not in self._allowed_users:
+            logger.debug(
+                "matrix_message_ignored_unauthorized",
+                room_id=room.room_id,
+                sender=event.sender,
+            )
+            return
+
+        lock = self._room_locks.setdefault(room.room_id, asyncio.Lock())
+        async with lock:
+            await self._set_typing(room.room_id, typing=True)
+            try:
+                reply = await self._handler.handle_message(
+                    room.room_id,
+                    event.sender,
+                    event.body,
+                )
+            except Exception:
+                logger.exception(
+                    "matrix_message_handler_crashed",
+                    room_id=room.room_id,
+                    sender=event.sender,
+                )
+                return
+            finally:
+                await self._set_typing(room.room_id, typing=False)
+
+            if reply is not None:
+                await self.send_message(room.room_id, reply)
+
+    async def _set_typing(self, room_id: str, *, typing: bool) -> None:
+        try:
+            await self._client.room_typing(room_id, typing_state=typing, timeout=60000)
+        except Exception as exc:
+            logger.debug("matrix_typing_failed", room_id=room_id, typing=typing, error=str(exc))
+
+    async def send_message(self, room_id: str, message: FormattedMessage) -> None:
+        """Send a Markdown + HTML reply to a Matrix room."""
+        content: dict[str, Any] = {
+            "msgtype": "m.text",
+            "body": message.body,
+            "format": "org.matrix.custom.html",
+            "formatted_body": message.formatted_body,
+        }
+        response = await self._client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=content,
+        )
+        if isinstance(response, RoomSendError):
+            logger.error(
+                "matrix_room_send_failed",
+                room_id=room_id,
+                error=response.message,
+            )
 
     async def close(self) -> None:
         """Close the Matrix client HTTP session."""

@@ -1,10 +1,20 @@
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from nio import LoginError, LoginResponse, SyncError, SyncResponse
+from nio import (
+    InviteMemberEvent,
+    LoginError,
+    LoginResponse,
+    RoomMessageText,
+    SyncError,
+    SyncResponse,
+)
 
 from matrix_mealie_chef.config import Settings
+from matrix_mealie_chef.formatting import FormattedMessage, format_markdown
 from matrix_mealie_chef.matrix_bot import (
     MatrixAuthError,
     MatrixBot,
@@ -52,6 +62,10 @@ class FakeAsyncClient:
         self.login_calls: list[dict[str, Any]] = []
         self.sync_calls: list[dict[str, Any]] = []
         self.closed = False
+        self.callbacks: list[tuple[Any, Any]] = []
+        self.joined_rooms: list[str] = []
+        self.typing_calls: list[tuple[str, bool]] = []
+        self.sent_messages: list[tuple[str, str, dict[str, Any]]] = []
 
     def restore_login(self, user_id: str, device_id: str, access_token: str) -> None:
         self.restored.append((user_id, device_id, access_token))
@@ -66,6 +80,28 @@ class FakeAsyncClient:
 
     async def close(self) -> None:
         self.closed = True
+
+    def add_event_callback(self, callback: Any, event_filter: Any) -> None:
+        self.callbacks.append((callback, event_filter))
+
+    async def join(self, room_id: str) -> SimpleNamespace:
+        self.joined_rooms.append(room_id)
+        return SimpleNamespace(room_id=room_id)
+
+    async def room_typing(
+        self,
+        room_id: str,
+        typing_state: bool = True,
+        timeout: int = 30000,  # noqa: ASYNC109
+    ) -> SimpleNamespace:
+        self.typing_calls.append((room_id, typing_state))
+        return SimpleNamespace()
+
+    async def room_send(
+        self, room_id: str, message_type: str, content: dict[str, Any]
+    ) -> SimpleNamespace:
+        self.sent_messages.append((room_id, message_type, content))
+        return SimpleNamespace(event_id="$reply")
 
 
 async def test_authenticate_prefers_env_access_token(tmp_path: Path) -> None:
@@ -163,3 +199,200 @@ async def test_initial_sync_raises_on_sync_error(tmp_path: Path) -> None:
     await bot.authenticate()
     with pytest.raises(MatrixSyncError, match="Gateway timeout"):
         await bot.initial_sync()
+
+
+class FakeHandler:
+    def __init__(
+        self,
+        reply: FormattedMessage | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.reply = reply or format_markdown("**Recipe ready**")
+        self.error = error
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def handle_message(
+        self, room_id: str, user_id: str, text: str
+    ) -> FormattedMessage | None:
+        self.calls.append((room_id, user_id, text))
+        if self.error is not None:
+            raise self.error
+        return self.reply
+
+
+def _make_message_event(*, sender: str, body: str, timestamp: int) -> RoomMessageText:
+    event = RoomMessageText.from_dict(
+        {
+            "event_id": "$ev1",
+            "sender": sender,
+            "origin_server_ts": timestamp,
+            "content": {"msgtype": "m.text", "body": body},
+        }
+    )
+    assert isinstance(event, RoomMessageText)
+    return event
+
+
+def _make_invite_event(
+    *, sender: str, state_key: str, membership: str = "invite"
+) -> InviteMemberEvent:
+    event = InviteMemberEvent.from_dict(
+        {
+            "sender": sender,
+            "state_key": state_key,
+            "type": "m.room.member",
+            "content": {"membership": membership},
+        }
+    )
+    assert isinstance(event, InviteMemberEvent)
+    return event
+
+
+async def test_on_message_handles_allowed_user_with_typing_and_html_reply(
+    tmp_path: Path,
+) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    handler = FakeHandler()
+    bot = MatrixBot(settings, handler=handler, client=fake_client)  # type: ignore[arg-type]
+    bot.register_callbacks()
+
+    room = SimpleNamespace(room_id="!kitchen:example.com")
+    event = _make_message_event(
+        sender="@alice:example.com",
+        body="eggs and spinach",
+        timestamp=bot.started_at_ms + 1000,
+    )
+
+    await bot._on_message(room, event)  # type: ignore[arg-type]
+
+    assert handler.calls == [("!kitchen:example.com", "@alice:example.com", "eggs and spinach")]
+    assert fake_client.typing_calls == [
+        ("!kitchen:example.com", True),
+        ("!kitchen:example.com", False),
+    ]
+    assert len(fake_client.sent_messages) == 1
+    room_id, msg_type, content = fake_client.sent_messages[0]
+    assert room_id == "!kitchen:example.com"
+    assert msg_type == "m.room.message"
+    assert content["body"] == "**Recipe ready**"
+    assert content["format"] == "org.matrix.custom.html"
+    assert "<strong>Recipe ready</strong>" in content["formatted_body"]
+
+
+async def test_on_message_ignores_self_unauthorized_and_pre_startup(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    handler = FakeHandler()
+    bot = MatrixBot(settings, handler=handler, client=fake_client)  # type: ignore[arg-type]
+    room = SimpleNamespace(room_id="!kitchen:example.com")
+
+    events = [
+        _make_message_event(
+            sender="@mealie-bot:example.com",
+            body="my own message",
+            timestamp=bot.started_at_ms + 1000,
+        ),
+        _make_message_event(
+            sender="@stranger:example.com",
+            body="hack me",
+            timestamp=bot.started_at_ms + 1000,
+        ),
+        _make_message_event(
+            sender="@alice:example.com",
+            body="old message",
+            timestamp=bot.started_at_ms - 1,
+        ),
+    ]
+    for ev in events:
+        await bot._on_message(room, ev)  # type: ignore[arg-type]
+
+    assert handler.calls == []
+    assert fake_client.sent_messages == []
+
+
+async def test_on_invite_auto_joins_only_allowed_users(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+
+    room_ok = SimpleNamespace(room_id="!allowed:example.com")
+    room_nope = SimpleNamespace(room_id="!stranger:example.com")
+
+    await bot._on_invite(
+        room_ok,  # type: ignore[arg-type]
+        _make_invite_event(sender="@alice:example.com", state_key="@mealie-bot:example.com"),
+    )
+    await bot._on_invite(
+        room_nope,  # type: ignore[arg-type]
+        _make_invite_event(sender="@stranger:example.com", state_key="@mealie-bot:example.com"),
+    )
+    await bot._on_invite(
+        room_nope,  # type: ignore[arg-type]
+        _make_invite_event(
+            sender="@alice:example.com",
+            state_key="@mealie-bot:example.com",
+            membership="join",
+        ),
+    )
+
+    assert fake_client.joined_rooms == ["!allowed:example.com"]
+
+
+async def test_on_message_serializes_room_processing_and_clears_typing_on_error(
+    tmp_path: Path,
+) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient()
+    timeline: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class SlowHandler:
+        async def handle_message(
+            self, room_id: str, user_id: str, text: str
+        ) -> FormattedMessage | None:
+            timeline.append(f"start:{text}")
+            if text == "first":
+                first_started.set()
+                await release_first.wait()
+            timeline.append(f"end:{text}")
+            return format_markdown(text)
+
+    bot = MatrixBot(settings, handler=SlowHandler(), client=fake_client)  # type: ignore[arg-type]
+    room = SimpleNamespace(room_id="!kitchen:example.com")
+    ts = bot.started_at_ms + 1000
+
+    task1 = asyncio.create_task(
+        bot._on_message(
+            room, _make_message_event(sender="@alice:example.com", body="first", timestamp=ts)
+        )  # type: ignore[arg-type]
+    )
+    await first_started.wait()
+    task2 = asyncio.create_task(
+        bot._on_message(
+            room, _make_message_event(sender="@alice:example.com", body="second", timestamp=ts + 1)
+        )  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    release_first.set()
+    await asyncio.gather(task1, task2)
+
+    assert timeline == ["start:first", "end:first", "start:second", "end:second"]
+
+    # Ensure typing indicator is still cleared if handler raises unexpectedly
+    fake_client.typing_calls.clear()
+    crashing_bot = MatrixBot(
+        settings,
+        handler=FakeHandler(error=RuntimeError("boom")),
+        client=fake_client,  # type: ignore[arg-type]
+    )
+    await crashing_bot._on_message(
+        room,  # type: ignore[arg-type]
+        _make_message_event(sender="@alice:example.com", body="oops", timestamp=ts + 2),
+    )
+    assert fake_client.typing_calls == [
+        ("!kitchen:example.com", True),
+        ("!kitchen:example.com", False),
+    ]
