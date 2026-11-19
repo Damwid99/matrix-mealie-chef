@@ -1,6 +1,7 @@
 """System prompts and message builders for recipe LLM calls."""
 
 import json
+from collections.abc import Sequence
 
 from matrix_mealie_chef.models import Recipe
 
@@ -40,4 +41,49 @@ def build_generate_messages(user_input: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input.strip()},
+    ]
+
+
+REFINE_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT
+    + """
+Refinement rules:
+8. You are updating an EXISTING recipe draft based on the user's feedback.
+9. Apply the requested changes accurately (e.g. swap ingredients, scale quantities and
+   servings proportionally, adjust spiciness, update tags or times) while preserving all
+   other details of the current recipe unless they conflict with the change.
+10. Keep the recipe in the same language as the current draft unless the user explicitly asks
+    to translate or switch languages.
+11. Always return the COMPLETE updated recipe JSON (not a partial diff).
+"""
+)
+
+
+def build_refine_messages(
+    current: Recipe,
+    instruction: str,
+    history: Sequence[str] | None = None,
+    *,
+    max_history: int = 6,
+) -> list[dict[str, str]]:
+    """Build chat messages to refine an existing recipe draft."""
+    sections = [
+        "Current recipe (JSON):",
+        current.model_dump_json(indent=2),
+    ]
+
+    if history and max_history > 0:
+        cleaned = [item.strip() for item in history if item.strip()]
+        trimmed = cleaned[-max_history:]
+        if trimmed:
+            history_lines = "\n".join(f"- {item}" for item in trimmed)
+            sections.append(
+                f"Earlier requests in this session (oldest to newest):\n{history_lines}"
+            )
+
+    sections.append(f"Requested change:\n{instruction.strip()}")
+
+    return [
+        {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+        {"role": "user", "content": "\n\n".join(sections)},
     ]

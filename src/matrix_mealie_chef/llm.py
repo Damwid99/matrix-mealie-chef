@@ -1,17 +1,22 @@
 """Model-agnostic async LLM client powered by LiteLLM."""
 
-import json  # noqa: I001
+import json
 import re
+from collections.abc import Sequence  # noqa: F401
 from typing import Any
 
 import litellm
 import structlog
+from litellm.exceptions import (  # noqa: F401
+    AuthenticationError,
+    BadRequestError,
+    RateLimitError,
+    UnsupportedParamsError,
+)
 from pydantic import ValidationError
 
 from matrix_mealie_chef.models import Recipe
-from matrix_mealie_chef.prompts import build_generate_messages
-
-import litellm.exceptions
+from matrix_mealie_chef.prompts import build_generate_messages, build_refine_messages  # noqa: F401
 
 logger = structlog.get_logger(__name__)
 
@@ -73,6 +78,7 @@ class RecipeLLMClient:
         timeout: float = 60.0,
         max_validation_retries: int = 2,
         temperature: float = 0.7,
+        max_history: int = 6,
     ) -> None:
         self._model = model
         self._api_key = api_key
@@ -81,6 +87,7 @@ class RecipeLLMClient:
         self._max_validation_retries = max_validation_retries
         self._temperature = temperature
         self._supports_response_format = True
+        self._max_history = max_history
 
     async def _call_model(
         self,
@@ -103,14 +110,11 @@ class RecipeLLMClient:
 
         try:
             response = await litellm.acompletion(**kwargs)
-        except litellm.litellm.exceptions.AuthenticationError as exc:
+        except AuthenticationError as exc:
             raise LLMAuthError(f"LLM authentication failed: {exc}") from exc
-        except litellm.litellm.exceptions.RateLimitError as exc:
+        except RateLimitError as exc:
             raise LLMRateLimitError(f"LLM rate limit exceeded: {exc}") from exc
-        except (
-            litellm.litellm.exceptions.UnsupportedParamsError,
-            litellm.litellm.exceptions.BadRequestError,
-        ) as exc:
+        except (UnsupportedParamsError, BadRequestError) as exc:
             if use_response_format:
                 logger.warning(
                     "llm_response_format_unsupported_fallback",
@@ -172,4 +176,19 @@ class RecipeLLMClient:
     async def generate(self, user_input: str) -> Recipe:
         """Generate a new structured recipe from free-form user text."""
         messages = build_generate_messages(user_input)
+        return await self._complete_recipe(messages)
+
+    async def refine(
+        self,
+        current: Recipe,
+        instruction: str,
+        history: Sequence[str] | None = None,
+    ) -> Recipe:
+        """Refine an existing recipe draft based on natural-language feedback."""
+        messages = build_refine_messages(
+            current,
+            instruction,
+            history,
+            max_history=self._max_history,
+        )
         return await self._complete_recipe(messages)
