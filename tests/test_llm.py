@@ -64,6 +64,9 @@ async def test_generate_recipe_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured_kwargs["api_key"] == "test-key"
     assert captured_kwargs["api_base"] == "http://custom.local"
     assert captured_kwargs["response_format"] is Recipe
+    assert captured_kwargs["drop_params"] is True
+    assert captured_kwargs["reasoning_effort"] == "low"
+    assert "temperature" not in captured_kwargs
     assert captured_kwargs["messages"][0]["role"] == "system"
     assert captured_kwargs["messages"][1] == {
         "role": "user",

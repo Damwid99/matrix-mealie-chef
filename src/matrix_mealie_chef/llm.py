@@ -13,6 +13,7 @@ from litellm.exceptions import (  # noqa: F401
     RateLimitError,
     UnsupportedParamsError,
 )
+from litellm.utils import supports_reasoning
 from pydantic import ValidationError
 
 from matrix_mealie_chef.models import Recipe
@@ -75,19 +76,27 @@ class RecipeLLMClient:
         *,
         api_key: str | None = None,
         api_base: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = 120.0,
         max_validation_retries: int = 2,
-        temperature: float = 0.7,
         max_history: int = 6,
+        temperature: float | None = None,
+        reasoning_effort: str | None = "low",
     ) -> None:
         self._model = model
         self._api_key = api_key
         self._api_base = api_base
         self._timeout = timeout
         self._max_validation_retries = max_validation_retries
-        self._temperature = temperature
-        self._supports_response_format = True
         self._max_history = max_history
+        self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
+        self._supports_response_format = True
+
+    def _model_supports_reasoning(self) -> bool:
+        try:
+            return bool(supports_reasoning(model=self._model))
+        except Exception:
+            return False
 
     async def _call_model(
         self,
@@ -99,8 +108,12 @@ class RecipeLLMClient:
             "model": self._model,
             "messages": messages,
             "timeout": self._timeout,
-            "temperature": self._temperature,
+            "drop_params": True,
         }
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
+        if self._reasoning_effort is not None and self._model_supports_reasoning():
+            kwargs["reasoning_effort"] = self._reasoning_effort
         if self._api_key is not None:
             kwargs["api_key"] = self._api_key
         if self._api_base is not None:
