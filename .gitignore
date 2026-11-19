@@ -1,0 +1,22 @@
+# Python & uv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Environment & runtime state
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+
+plan.md
