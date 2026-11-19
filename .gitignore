@@ -18,5 +18,3 @@ build/
 !.env.example
 data/*
 !data/.gitkeep
-
-plan.md
