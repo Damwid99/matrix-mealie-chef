@@ -1,5 +1,6 @@
 """Markdown and HTML message formatting for Matrix replies."""
 
+import re
 from dataclasses import dataclass
 
 import markdown
@@ -7,30 +8,28 @@ import markdown
 from matrix_mealie_chef.mealie import CreatedRecipe
 from matrix_mealie_chef.models import Recipe
 
+_LIST_LINE_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+\.)[ \t]+")
+
 _FOOTER = (
     "---\n"
     "*Reply with any tweaks to refine this draft, `!save` to save to Mealie, "
     "`!discard` to cancel, or `!new <idea>` to start over.*"
 )
 
-_HELP_TEXT = """\
-### Matrix Mealie Chef
-
-Send me ingredients, a rough dinner idea, or messy recipe notes and we can brainstorm
-and draft a recipe together.
-
-Reply naturally to refine it (e.g. *"double the servings"*, *"make it vegan"*,
-*"swap butter for olive oil"*), and when it looks good, type `!save` to structure
-and save it to Mealie.
-
-**Commands**
-
-- `!save` — extract and save the current draft to Mealie
-- `!show` — display the latest draft reply again
-- `!discard` (or `!cancel`) — throw away the current draft
-- `!new <idea>` — discard any active draft and start fresh
-- `!help` — show this message
-"""
+_HELP_TEXT = (
+    "### Matrix Mealie Chef\n\n"
+    "Send me ingredients, a rough dinner idea, or messy recipe notes and we can "
+    "brainstorm and draft a recipe together.\n\n"
+    'Reply naturally to refine it (e.g. *"double the servings"*, *"make it vegan"*, '
+    '*"swap butter for olive oil"*), and when it looks good, type `!save` to '
+    "structure and save it to Mealie.\n\n"
+    "**Commands**\n\n"
+    "- `!save` — extract and save the current draft to Mealie\n"
+    "- `!show` — display the latest draft reply again\n"
+    "- `!discard` (or `!cancel`) — throw away the current draft\n"
+    "- `!new <idea>` — discard any active draft and start fresh\n"
+    "- `!help` — show this message"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,11 +38,6 @@ class FormattedMessage:
 
     body: str
     formatted_body: str
-
-
-def markdown_to_html(text: str) -> str:
-    """Render Markdown to clean HTML suitable for Matrix `org.matrix.custom.html`."""
-    return markdown.markdown(text, extensions=["sane_lists"])
 
 
 def format_markdown(text: str) -> FormattedMessage:
@@ -112,3 +106,21 @@ def format_saved_recipe(created: CreatedRecipe) -> FormattedMessage:
 def format_help() -> FormattedMessage:
     """Format the `!help` usage guide."""
     return format_markdown(_HELP_TEXT.strip())
+
+
+def _normalize_markdown(text: str) -> str:
+    """Ensure blank lines before Markdown lists so python-markdown renders them as lists."""
+    lines = text.splitlines()
+    out: list[str] = []
+    for line in lines:
+        if out and _LIST_LINE_RE.match(line):
+            prev = out[-1]
+            if prev.strip() and not _LIST_LINE_RE.match(prev):
+                out.append("")
+        out.append(line)
+    return "\n".join(out)
+
+
+def markdown_to_html(text: str) -> str:
+    """Render Markdown to clean HTML suitable for Matrix `org.matrix.custom.html`."""
+    return markdown.markdown(_normalize_markdown(text), extensions=["sane_lists", "nl2br"])
