@@ -135,3 +135,23 @@ def test_format_saved_recipe_and_help() -> None:
     help_msg = format_help()
     assert "!save" in help_msg.body
     assert "<ul>" in help_msg.formatted_body
+
+
+def test_markdown_to_html_handles_lists_without_preceding_blank_line() -> None:
+    llm_reply = (
+        "**Ingredients**\n"
+        "* 40 g ground cinnamon\n"
+        "* 15 g ground ginger\n\n"
+        "**Instructions**\n"
+        "1. Grind whole spices.\n"
+        "2. Mix together.\n\n"
+        "**Tags:** #spice-blend\n"
+        "**Categories:** Pantry Staples"
+    )
+    msg = format_draft_reply(llm_reply, include_footer=False)
+
+    assert "<ul>" in msg.formatted_body
+    assert "<li>40 g ground cinnamon</li>" in msg.formatted_body
+    assert "<ol>" in msg.formatted_body
+    assert "<li>Grind whole spices.</li>" in msg.formatted_body
+    assert "<br />" in msg.formatted_body
