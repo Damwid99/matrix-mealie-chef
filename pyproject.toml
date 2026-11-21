@@ -1,6 +1,6 @@
 [project]
 name = "matrix-mealie-chef"
-version = "0.1.1"
+version = "0.1.2"
 description = "Conversational Matrix bot that generates, refines, and saves recipes to Mealie using LLMs."
 readme = "README.md"
 requires-python = ">=3.12"
