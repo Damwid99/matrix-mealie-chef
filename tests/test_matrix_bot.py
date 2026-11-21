@@ -66,19 +66,10 @@ class FakeAsyncClient:
         self.joined_rooms: list[str] = []
         self.typing_calls: list[tuple[str, bool]] = []
         self.sent_messages: list[tuple[str, str, dict[str, Any]]] = []
-        self.sync_forever_calls = 0
-        self.sync_forever_errors: list[Exception] = []
         self.sync_forever_started = asyncio.Event()
 
     def restore_login(self, user_id: str, device_id: str, access_token: str) -> None:
         self.restored.append((user_id, device_id, access_token))
-
-    async def sync_forever(self, **_: Any) -> None:
-        self.sync_forever_calls += 1
-        self.sync_forever_started.set()
-        if self.sync_forever_errors:
-            raise self.sync_forever_errors.pop(0)
-        await asyncio.Event().wait()
 
     async def login(self, password: str | None = None, device_name: str = "") -> Any:
         self.login_calls.append({"password": password, "device_name": device_name})
@@ -86,7 +77,14 @@ class FakeAsyncClient:
 
     async def sync(self, **kwargs: Any) -> Any:
         self.sync_calls.append(kwargs)
-        return self.sync_responses.pop(0)
+        if len(self.sync_calls) >= 2:
+            self.sync_forever_started.set()
+        if self.sync_responses:
+            item = self.sync_responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        await asyncio.Event().wait()
 
     async def close(self) -> None:
         self.closed = True
@@ -117,7 +115,7 @@ class FakeAsyncClient:
 async def test_authenticate_prefers_env_access_token(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, password="secret", access_token="syt_env")
     fake_client = FakeAsyncClient()
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     await bot.authenticate()
 
@@ -129,7 +127,7 @@ async def test_authenticate_prefers_env_access_token(tmp_path: Path) -> None:
 async def test_authenticate_password_login_saves_session(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, password="secret")
     fake_client = FakeAsyncClient()
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     await bot.authenticate()
 
@@ -155,7 +153,7 @@ async def test_authenticate_restores_cached_session_without_password_login(tmp_p
         ),
     )
     fake_client = FakeAsyncClient()
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     await bot.authenticate()
 
@@ -180,7 +178,7 @@ async def test_initial_sync_relogs_in_when_cached_token_is_invalid(tmp_path: Pat
             SyncResponse.from_dict({"next_batch": "s_fresh"}),
         ]
     )
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     await bot.authenticate()
     next_batch = await bot.initial_sync()
@@ -195,7 +193,7 @@ async def test_initial_sync_relogs_in_when_cached_token_is_invalid(tmp_path: Pat
 async def test_authenticate_raises_on_login_error(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, password="wrong")
     fake_client = FakeAsyncClient(login_response=LoginError(message="Forbidden"))
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     with pytest.raises(MatrixAuthError, match="Forbidden"):
         await bot.authenticate()
@@ -204,7 +202,7 @@ async def test_authenticate_raises_on_login_error(tmp_path: Path) -> None:
 async def test_initial_sync_raises_on_sync_error(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, access_token="syt_env")
     fake_client = FakeAsyncClient(sync_responses=[SyncError(message="Gateway timeout")])
-    bot = MatrixBot(settings, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, client=fake_client)
 
     await bot.authenticate()
     with pytest.raises(MatrixSyncError, match="Gateway timeout"):
@@ -265,7 +263,7 @@ async def test_on_message_handles_allowed_user_with_typing_and_html_reply(
     settings = _make_settings(tmp_path, access_token="syt_env")
     fake_client = FakeAsyncClient()
     handler = FakeHandler()
-    bot = MatrixBot(settings, handler=handler, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, handler=handler, client=fake_client)
     bot.register_callbacks()
 
     room = SimpleNamespace(room_id="!kitchen:example.com")
@@ -275,7 +273,7 @@ async def test_on_message_handles_allowed_user_with_typing_and_html_reply(
         timestamp=bot.started_at_ms + 1000,
     )
 
-    await bot._on_message(room, event)  # type: ignore[arg-type]
+    await bot._on_message(room, event)
 
     assert handler.calls == [("!kitchen:example.com", "@alice:example.com", "eggs and spinach")]
     assert fake_client.typing_calls == [
@@ -295,7 +293,7 @@ async def test_on_message_ignores_self_unauthorized_and_pre_startup(tmp_path: Pa
     settings = _make_settings(tmp_path, access_token="syt_env")
     fake_client = FakeAsyncClient()
     handler = FakeHandler()
-    bot = MatrixBot(settings, handler=handler, client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, handler=handler, client=fake_client)
     room = SimpleNamespace(room_id="!kitchen:example.com")
 
     events = [
@@ -316,7 +314,7 @@ async def test_on_message_ignores_self_unauthorized_and_pre_startup(tmp_path: Pa
         ),
     ]
     for ev in events:
-        await bot._on_message(room, ev)  # type: ignore[arg-type]
+        await bot._on_message(room, ev)
 
     assert handler.calls == []
     assert fake_client.sent_messages == []
@@ -325,21 +323,21 @@ async def test_on_message_ignores_self_unauthorized_and_pre_startup(tmp_path: Pa
 async def test_on_invite_auto_joins_only_allowed_users(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, access_token="syt_env")
     fake_client = FakeAsyncClient()
-    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)
 
     room_ok = SimpleNamespace(room_id="!allowed:example.com")
     room_nope = SimpleNamespace(room_id="!stranger:example.com")
 
     await bot._on_invite(
-        room_ok,  # type: ignore[arg-type]
+        room_ok,
         _make_invite_event(sender="@alice:example.com", state_key="@mealie-bot:example.com"),
     )
     await bot._on_invite(
-        room_nope,  # type: ignore[arg-type]
+        room_nope,
         _make_invite_event(sender="@stranger:example.com", state_key="@mealie-bot:example.com"),
     )
     await bot._on_invite(
-        room_nope,  # type: ignore[arg-type]
+        room_nope,
         _make_invite_event(
             sender="@alice:example.com",
             state_key="@mealie-bot:example.com",
@@ -370,20 +368,20 @@ async def test_on_message_serializes_room_processing_and_clears_typing_on_error(
             timeline.append(f"end:{text}")
             return format_markdown(text)
 
-    bot = MatrixBot(settings, handler=SlowHandler(), client=fake_client)  # type: ignore[arg-type]
+    bot = MatrixBot(settings, handler=SlowHandler(), client=fake_client)
     room = SimpleNamespace(room_id="!kitchen:example.com")
     ts = bot.started_at_ms + 1000
 
     task1 = asyncio.create_task(
         bot._on_message(
             room, _make_message_event(sender="@alice:example.com", body="first", timestamp=ts)
-        )  # type: ignore[arg-type]
+        )
     )
     await first_started.wait()
     task2 = asyncio.create_task(
         bot._on_message(
             room, _make_message_event(sender="@alice:example.com", body="second", timestamp=ts + 1)
-        )  # type: ignore[arg-type]
+        )
     )
     await asyncio.sleep(0)
     release_first.set()
@@ -396,10 +394,10 @@ async def test_on_message_serializes_room_processing_and_clears_typing_on_error(
     crashing_bot = MatrixBot(
         settings,
         handler=FakeHandler(error=RuntimeError("boom")),
-        client=fake_client,  # type: ignore[arg-type]
+        client=fake_client,
     )
     await crashing_bot._on_message(
-        room,  # type: ignore[arg-type]
+        room,
         _make_message_event(sender="@alice:example.com", body="oops", timestamp=ts + 2),
     )
     assert fake_client.typing_calls == [
@@ -410,8 +408,8 @@ async def test_on_message_serializes_room_processing_and_clears_typing_on_error(
 
 async def test_run_forever_starts_and_stops_cleanly(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, access_token="syt_env")
-    fake_client = FakeAsyncClient()
-    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+    fake_client = FakeAsyncClient(sync_responses=[SyncResponse.from_dict({"next_batch": "s1"})])
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)
     stop_event = asyncio.Event()
 
     task = asyncio.create_task(bot.run_forever(stop_event=stop_event))
@@ -420,20 +418,52 @@ async def test_run_forever_starts_and_stops_cleanly(tmp_path: Path) -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
     assert len(fake_client.restored) == 1
-    assert len(fake_client.sync_calls) == 1
+    assert len(fake_client.sync_calls) == 2
     assert [f for _, f in fake_client.callbacks] == [InviteMemberEvent, RoomMessageText]
-    assert fake_client.sync_forever_calls == 1
 
 
-async def test_run_forever_reconnects_after_sync_error(tmp_path: Path) -> None:
+async def test_run_forever_backs_off_on_sync_error_and_recovers(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path, access_token="syt_env")
-    fake_client = FakeAsyncClient()
-    fake_client.sync_forever_errors = [ConnectionError("temporary drop")]
-    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)  # type: ignore[arg-type]
+    fake_client = FakeAsyncClient(
+        sync_responses=[
+            SyncResponse.from_dict({"next_batch": "s1"}),
+            SyncError(message="Gateway timeout", status_code="504"),
+            SyncError(message="Rate limited", status_code="M_LIMIT_EXCEEDED", retry_after_ms=20),
+            SyncResponse.from_dict({"next_batch": "s2"}),
+        ]
+    )
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)
+    stop_event = asyncio.Event()
+
+    async def stop_after_recovery() -> None:
+        while len(fake_client.sync_calls) < 5:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        stop_event.set()
+
+    stopper = asyncio.create_task(stop_after_recovery())
+    await asyncio.wait_for(
+        bot.run_forever(stop_event=stop_event, initial_backoff=0.01, max_backoff=0.05),
+        timeout=2.0,
+    )
+    await stopper
+
+    assert len(fake_client.sync_calls) == 5
+
+
+async def test_run_forever_reconnects_after_sync_exception(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, access_token="syt_env")
+    fake_client = FakeAsyncClient(
+        sync_responses=[
+            SyncResponse.from_dict({"next_batch": "s1"}),
+            ConnectionError("temporary drop"),
+            SyncResponse.from_dict({"next_batch": "s2"}),
+        ]
+    )
+    bot = MatrixBot(settings, handler=FakeHandler(), client=fake_client)
     stop_event = asyncio.Event()
 
     async def stop_after_reconnect() -> None:
-        while fake_client.sync_forever_calls < 2:  # noqa: ASYNC110
+        while len(fake_client.sync_calls) < 4:  # noqa: ASYNC110
             await asyncio.sleep(0.01)
         stop_event.set()
 
@@ -444,4 +474,4 @@ async def test_run_forever_reconnects_after_sync_error(tmp_path: Path) -> None:
     )
     await stopper
 
-    assert fake_client.sync_forever_calls == 2
+    assert len(fake_client.sync_calls) == 4

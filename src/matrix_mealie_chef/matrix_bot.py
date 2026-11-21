@@ -342,7 +342,7 @@ class MatrixBot:
         initial_backoff: float = 2.0,
         max_backoff: float = 60.0,
     ) -> None:
-        """Authenticate, perform initial sync, and run the sync loop with reconnect backoff."""
+        """Authenticate, perform initial sync, and run the sync loop with backoff on errors."""
         if self._handler is None:
             raise MatrixBotError("Cannot run MatrixBot without a message handler")
 
@@ -357,11 +357,11 @@ class MatrixBot:
         backoff = initial_backoff
 
         while not shutdown.is_set():
-            started = time.monotonic()
-            sync_task: asyncio.Task[Any] = asyncio.create_task(
-                self._client.sync_forever(timeout=sync_timeout_ms, full_state=False)
+            sync_task: asyncio.Task[SyncResponse | SyncError] = asyncio.create_task(
+                self._client.sync(timeout=sync_timeout_ms, full_state=False)
             )
             stop_task: asyncio.Task[bool] = asyncio.create_task(shutdown.wait())
+            delay: float | None = None
             try:
                 _, pending = await asyncio.wait(
                     {sync_task, stop_task},
@@ -376,18 +376,44 @@ class MatrixBot:
                     break
 
                 exc = sync_task.exception()
-                if exc is None:
-                    logger.info("matrix_sync_loop_ended")
-                    break
+                if exc is not None:
+                    logger.warning(
+                        "matrix_sync_exception_reconnecting",
+                        error=str(exc),
+                        backoff_seconds=backoff,
+                    )
+                    delay = backoff
+                else:
+                    response = sync_task.result()
+                    if isinstance(response, SyncResponse):
+                        backoff = initial_backoff
+                        continue
 
-                if time.monotonic() - started >= 30.0:
-                    backoff = initial_backoff
+                    status_code = getattr(response, "status_code", None)
+                    if (
+                        status_code == "M_UNKNOWN_TOKEN"
+                        and self._settings.matrix_password is not None
+                    ):
+                        logger.warning("matrix_token_invalid_relogging_in")
+                        self._session_path.unlink(missing_ok=True)
+                        try:
+                            await self._login_with_password()
+                        except MatrixAuthError as auth_exc:
+                            logger.error("matrix_relogin_failed", error=str(auth_exc))
 
-                logger.warning(
-                    "matrix_sync_error_reconnecting",
-                    error=str(exc),
-                    backoff_seconds=backoff,
-                )
+                    retry_after_ms = getattr(response, "retry_after_ms", None)
+                    retry_after = (
+                        retry_after_ms / 1000.0
+                        if isinstance(retry_after_ms, (int, float)) and retry_after_ms > 0
+                        else 0.0
+                    )
+                    delay = min(max(backoff, retry_after), max_backoff)
+                    logger.warning(
+                        "matrix_sync_error_backing_off",
+                        status_code=status_code,
+                        error=getattr(response, "message", str(response)),
+                        backoff_seconds=delay,
+                    )
             finally:
                 if not sync_task.done():
                     sync_task.cancel()
@@ -398,11 +424,12 @@ class MatrixBot:
                     with contextlib.suppress(asyncio.CancelledError):
                         await stop_task
 
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=backoff)
-                break
-            except TimeoutError:
-                backoff = min(backoff * 2.0, max_backoff)
+            if delay is not None:
+                try:
+                    await asyncio.wait_for(shutdown.wait(), timeout=delay)
+                    break
+                except TimeoutError:
+                    backoff = min(backoff * 2.0, max_backoff)
 
     async def close(self) -> None:
         """Close the Matrix client HTTP session."""
